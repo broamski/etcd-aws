@@ -21,7 +21,7 @@ func MakeHealthCheck(parameters *Parameters, t *cfn.Template) error {
 		AlarmDescription:   cfn.String("master instance health"),
 		AlarmName:          cfn.String("MasterInstanceHealth"),
 		ComparisonOperator: cfn.String("LessThanThreshold"),
-		EvaluationPeriods:  cfn.String("1"),
+		EvaluationPeriods:  cfn.Integer(1),
 		Dimensions: &cfn.CloudWatchMetricDimensionList{
 			cfn.CloudWatchMetricDimension{
 				Name:  cfn.String("LoadBalancerName"),
@@ -30,7 +30,7 @@ func MakeHealthCheck(parameters *Parameters, t *cfn.Template) error {
 		},
 		MetricName: cfn.String("HealthyHostCount"),
 		Namespace:  cfn.String("AWS/ELB"),
-		Period:     cfn.String("60"),
+		Period:     cfn.Integer(60),
 		Statistic:  cfn.String("Minimum"),
 		Unit:       cfn.String("Count"),
 
@@ -51,7 +51,7 @@ func MakeHealthCheck(parameters *Parameters, t *cfn.Template) error {
 		AlarmDescription:        cfn.String("key backup count"),
 		AlarmName:               cfn.String("MasterBackupKeyCount"),
 		ComparisonOperator:      cfn.String("LessThanThreshold"),
-		EvaluationPeriods:       cfn.String("1"),
+		EvaluationPeriods:       cfn.Integer(1),
 		Dimensions: &cfn.CloudWatchMetricDimensionList{
 			cfn.CloudWatchMetricDimension{
 				Name:  cfn.String("AutoScalingGroupName"),
@@ -60,7 +60,7 @@ func MakeHealthCheck(parameters *Parameters, t *cfn.Template) error {
 		},
 		MetricName: cfn.String("BackupKeyCount"),
 		Namespace:  cfn.String("Local/etcd"),
-		Period:     cfn.String("300"),
+		Period:     cfn.Integer(300),
 		Statistic:  cfn.String("Minimum"),
 		Unit:       cfn.String("Count"),
 		Threshold:  cfn.String("1"),

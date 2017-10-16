@@ -2,10 +2,12 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -15,12 +17,12 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/coreos/go-etcd/etcd"
+	"github.com/coreos/etcd/client"
 	"github.com/crewjam/ec2cluster"
 )
 
 // backupService invokes backupOnce() periodically if the current node is the cluster leader.
-func backupService(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string, interval time.Duration) error {
+func backupService(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string, interval time.Duration, prefix bool) error {
 	instance, err := s.Instance()
 	if err != nil {
 		return err
@@ -51,7 +53,12 @@ func backupService(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir strin
 			continue
 		}
 
-		if err := backupOnce(s, backupBucket, backupKey, dataDir); err != nil {
+		defaultBackupKey := backupKey
+		if prefix {
+			timePrefix := time.Now().UTC().Format("2006-01-02T15:04:05")
+			defaultBackupKey = fmt.Sprintf("/%s-%s", timePrefix, strings.Trim(backupKey, "/"))
+		}
+		if err := backupOnce(s, backupBucket, defaultBackupKey, dataDir); err != nil {
 			return err
 		}
 	}
@@ -72,8 +79,9 @@ func getInstanceTag(instance *ec2.Instance, tagName string) string {
 
 // dumpEtcdNode writes a JSON representation of the nodes and and below `key`
 // to `w`. Returns the number of nodes traversed.
-func dumpEtcdNode(key string, etcdClient *etcd.Client, w io.Writer) (int, error) {
-	response, err := etcdClient.Get(key, false, false)
+func dumpEtcdNode(key string, etcdClient client.Client, w io.Writer) (int, error) {
+	kapi := client.NewKeysAPI(etcdClient)
+	response, err := kapi.Get(context.Background(), key, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -114,8 +122,17 @@ func backupOnce(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string) 
 	if err != nil {
 		return err
 	}
-	etcdClient := etcd.NewClient([]string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)})
-	if success := etcdClient.SyncCluster(); !success {
+	cfg := client.Config{
+		Endpoints:               []string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)},
+		Transport:               client.DefaultTransport,
+		HeaderTimeoutPerRequest: time.Second,
+	}
+	etcdClient, err := client.New(cfg)
+	if err != nil {
+		return fmt.Errorf("Could not create etcd client")
+	}
+
+	if success := etcdClient.Sync(context.Background()); success != nil {
 		return fmt.Errorf("backupOnce: cannot sync machines")
 	}
 
@@ -173,10 +190,10 @@ func backupOnce(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir string) 
 
 // loadEtcdNode reads `r` containing JSON objects representing etcd nodes and
 // loads them into server.
-func loadEtcdNode(etcdClient *etcd.Client, r io.Reader) error {
+func loadEtcdNode(etcdClient client.Client, r io.Reader) error {
 	jsonReader := json.NewDecoder(r)
 	for {
-		node := etcd.Node{}
+		node := client.Node{}
 		if err := jsonReader.Decode(&node); err != nil {
 			if err == io.EOF {
 				break
@@ -197,13 +214,16 @@ func loadEtcdNode(etcdClient *etcd.Client, r io.Reader) error {
 			}
 		}
 
+		kapi := client.NewKeysAPI(etcdClient)
 		if node.Dir {
-			_, err := etcdClient.SetDir(node.Key, uint64(ttl))
+			opts := client.SetOptions{Dir: true, TTL: time.Duration(ttl) * time.Second}
+			_, err := kapi.Set(context.Background(), node.Key, "", &opts)
 			if err != nil {
 				return fmt.Errorf("%s: %s", node.Key, err)
 			}
 		} else {
-			_, err := etcdClient.Set(node.Key, node.Value, uint64(ttl))
+			opts := client.SetOptions{TTL: time.Duration(ttl) * time.Second}
+			_, err := kapi.Set(context.Background(), node.Key, node.Value, &opts)
 			if err != nil {
 				return fmt.Errorf("%s: %s", node.Key, err)
 			}
@@ -218,8 +238,17 @@ func restoreBackup(s *ec2cluster.Cluster, backupBucket, backupKey, dataDir strin
 	if err != nil {
 		return err
 	}
-	etcdClient := etcd.NewClient([]string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)})
-	if success := etcdClient.SyncCluster(); !success {
+	cfg := client.Config{
+		Endpoints:               []string{fmt.Sprintf("http://%s:2379", *instance.PrivateIpAddress)},
+		Transport:               client.DefaultTransport,
+		HeaderTimeoutPerRequest: time.Second,
+	}
+	etcdClient, err := client.New(cfg)
+	if err != nil {
+		return fmt.Errorf("error creating etcd client")
+	}
+
+	if err = etcdClient.Sync(context.Background()); err != nil {
 		return fmt.Errorf("restore: cannot sync machines")
 	}
 

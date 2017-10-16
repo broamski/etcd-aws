@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,12 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/coreos/go-etcd/etcd"
+	"github.com/coreos/etcd/client"
 	"github.com/crewjam/awsregion"
 	"github.com/crewjam/ec2cluster"
 )
@@ -61,6 +63,10 @@ func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialClu
 		return "", nil, fmt.Errorf("list members: %s", err)
 	}
 
+	c := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
 	initialClusterState = "new"
 	initialCluster = []string{}
 	for _, instance := range clusterInstances {
@@ -78,7 +84,7 @@ func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialClu
 		}
 
 		// fetch the state of the node.
-		resp, err := http.Get(fmt.Sprintf("http://%s:2379/v2/stats/self", *instance.PrivateIpAddress))
+		resp, err := c.Get(fmt.Sprintf("http://%s:2379/v2/stats/self", *instance.PrivateIpAddress))
 		if err != nil {
 			log.Printf("%s: http://%s:2379/v2/stats/self: %s", *instance.InstanceId,
 				*instance.PrivateIpAddress, err)
@@ -110,7 +116,7 @@ func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialClu
 				PeerURLs: []string{fmt.Sprintf("http://%s:2380", *localInstance.PrivateIpAddress)},
 			}
 			body, _ := json.Marshal(m)
-			http.Post(fmt.Sprintf("http://%s:2379/v2/members", *instance.PrivateIpAddress),
+			c.Post(fmt.Sprintf("http://%s:2379/v2/members", *instance.PrivateIpAddress),
 				"application/json", bytes.NewReader(body))
 		}
 	}
@@ -122,6 +128,24 @@ func main() {
 		"The instance ID of the cluster member. If not supplied, then the instance ID is determined from EC2 metadata")
 	clusterTagName := flag.String("tag", "aws:autoscaling:groupName",
 		"The instance tag that is common to all members of the cluster")
+
+	defaultDisableRestore := "0"
+	if d := os.Getenv("ETCD_DISABLE_RESTORE"); d != "" {
+		defaultDisableRestore = d
+	}
+	disableRestore := flag.Bool("disable-restore", func() bool {
+		b, err := strconv.ParseBool(defaultDisableRestore)
+		return err == nil && b
+	}(), "Disable auto-restore of a backup when a new cluster is being created")
+
+	defaultDisableBackup := "0"
+	if d := os.Getenv("ETCD_DISABLE_BACKUP"); d != "" {
+		defaultDisableBackup = d
+	}
+	disableBackup := flag.Bool("disable-backup", func() bool {
+		b, err := strconv.ParseBool(defaultDisableBackup)
+		return err == nil && b
+	}(), "Disable auto-backup of etcd. Not reccomended for production. ")
 
 	defaultBackupInterval := 5 * time.Minute
 	if d := os.Getenv("ETCD_BACKUP_INTERVAL"); d != "" {
@@ -137,15 +161,33 @@ func main() {
 	backupBucket := flag.String("backup-bucket", os.Getenv("ETCD_BACKUP_BUCKET"),
 		"The name of the S3 bucket where tha backup is stored. "+
 			"Environment variable: ETCD_BACKUP_BUCKET")
+
+	defaultBackupKeyTstampPrefix := "True"
+	if d := os.Getenv("ETCD_BACKUP_KEY_TSTAMP_PREFIX"); d != "" {
+		defaultBackupKeyTstampPrefix = d
+	}
+	backupKeyTstampPrefix := flag.Bool("backup-timestamp-prefix", func() bool {
+		b, err := strconv.ParseBool(defaultBackupKeyTstampPrefix)
+		return err == nil && b
+	}(), "Prepend a timestamp to the backup key")
+
 	defaultBackupKey := "/etcd-backup.gz"
 	if d := os.Getenv("ETCD_BACKUP_KEY"); d != "" {
 		defaultBackupKey = d
 	}
 	backupKey := flag.String("backup-key", defaultBackupKey,
-		"The name of the S3 key where tha backup is stored. "+
+		"The name of the S3 key where the backup is stored. "+
 			"Environment variable: ETCD_BACKUP_KEY")
 
-	defaultDataDir := "/var/lib/etcd2"
+	defaultRestoreKey := "/etcd-backup.gz"
+	if d := os.Getenv("ETCD_RESTORE_KEY"); d != "" {
+		defaultRestoreKey = d
+	}
+	restoreKey := flag.String("restore-key", defaultRestoreKey,
+		"The name of the S3 key that used be used for a restore. "+
+			"Environment variable: ETCD_RESTORE_KEY")
+
+	defaultDataDir := "/var/lib/etcd"
 	if d := os.Getenv("ETCD_DATA_DIR"); d != "" {
 		defaultDataDir = d
 	}
@@ -181,35 +223,53 @@ func main() {
 
 	initialClusterState, initialCluster, err := buildCluster(s)
 
-	// start the backup and restore goroutine.
+	// start the backup and restore goroutines, if applicable
 	shouldTryRestore := false
-	if initialClusterState == "new" {
-		_, err := os.Stat(filepath.Join(*dataDir, "member"))
-		if os.IsNotExist(err) {
-			shouldTryRestore = true
-		} else {
-			log.Printf("%s: %s", filepath.Join(*dataDir, "member"), err)
+	if !*disableRestore {
+		if initialClusterState == "new" {
+			_, err := os.Stat(filepath.Join(*dataDir, "member"))
+			if os.IsNotExist(err) {
+				shouldTryRestore = true
+			} else {
+				log.Printf("%s: %s", filepath.Join(*dataDir, "member"), err)
+			}
 		}
+	} else {
+		log.Printf("restoring from backup is disabled")
 	}
 	go func() {
 		// wait for etcd to start
 		for {
-			etcdClient := etcd.NewClient([]string{fmt.Sprintf("http://%s:2379",
-				*localInstance.PrivateIpAddress)})
-			if success := etcdClient.SyncCluster(); success {
+			log.Printf("waiting for etcd to start....")
+			cfg := client.Config{
+				Endpoints:               []string{fmt.Sprintf("http://%s:2379", *localInstance.PrivateIpAddress)},
+				Transport:               client.DefaultTransport,
+				HeaderTimeoutPerRequest: time.Second,
+			}
+			etcdClient, err := client.New(cfg)
+			if err != nil {
+				log.Fatalf("ERROR: %s", err)
+			}
+			if err := etcdClient.Sync(context.Background()); err == nil {
 				break
 			}
 			time.Sleep(time.Second)
 		}
 
 		if shouldTryRestore {
-			if err := restoreBackup(s, *backupBucket, *backupKey, *dataDir); err != nil {
+			log.Printf("attempting to restore from backup: %s, %s, %s", *backupBucket, *restoreKey, *dataDir)
+			if err := restoreBackup(s, *backupBucket, *restoreKey, *dataDir); err != nil {
 				log.Fatalf("ERROR: %s", err)
 			}
 		}
 
-		if err := backupService(s, *backupBucket, *backupKey, *dataDir, *backupInterval); err != nil {
-			log.Fatalf("ERROR: %s", err)
+		if !*disableBackup {
+			log.Printf("staring backup service: destination: %s, interval: %s", *backupBucket, *backupInterval)
+			if err := backupService(s, *backupBucket, *backupKey, *dataDir, *backupInterval, *backupKeyTstampPrefix); err != nil {
+				log.Fatalf("ERROR: %s", err)
+			}
+		} else {
+			log.Warn("backup service is disabled")
 		}
 	}()
 
@@ -223,7 +283,7 @@ func main() {
 	cmd.Stderr = os.Stderr
 	cmd.Env = []string{
 		fmt.Sprintf("ETCD_NAME=%s", *localInstance.InstanceId),
-		fmt.Sprintf("ETCD_DATA_DIR=/var/lib/etcd2"),
+		fmt.Sprintf("ETCD_DATA_DIR=/var/lib/etcd"),
 		fmt.Sprintf("ETCD_ELECTION_TIMEOUT=1200"),
 		fmt.Sprintf("ETCD_ADVERTISE_CLIENT_URLS=http://%s:2379", *localInstance.PrivateIpAddress),
 		fmt.Sprintf("ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379"),
